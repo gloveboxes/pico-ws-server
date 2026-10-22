@@ -11,7 +11,20 @@
 
 namespace {
 
-constexpr auto POLL_TIMER_COARSE = 10; // around 5 seconds
+constexpr auto POLL_TIMER_COARSE = 1; // around 500 ms
+
+err_t finish_connection(ClientConnection* connection, tcp_pcb* pcb) {
+  tcp_arg(pcb, nullptr);
+  tcp_recv(pcb, nullptr);
+  tcp_sent(pcb, nullptr);
+  tcp_err(pcb, nullptr);
+  tcp_poll(pcb, nullptr, 0);
+  connection->onClose();
+  if (tcp_close(pcb) == ERR_OK)
+    return ERR_OK;
+  tcp_abort(pcb);
+  return ERR_ABRT;
+}
 
 err_t on_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* pb, err_t err) {
   cyw43_arch_lwip_check();
@@ -28,7 +41,7 @@ err_t on_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* pb, err_t err) {
 
   bool keep_connection;
   if (pb) {
-    keep_connection = connection->process(pb);
+    keep_connection = err == ERR_OK && connection->process(pb);
     tcp_recved(pcb, pb->tot_len);
     pbuf_free(pb);
   } else {
@@ -39,13 +52,7 @@ err_t on_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* pb, err_t err) {
   if (!keep_connection) {
     DEBUG("closing connection");
 
-    tcp_arg(pcb, nullptr);
-    connection->onClose();
-
-    if (tcp_close(pcb) != ERR_OK) {
-      tcp_abort(pcb);
-      return ERR_ABRT;
-    }
+    return finish_connection(connection, pcb);
   }
 
   return ERR_OK;
@@ -65,13 +72,7 @@ err_t on_sent(void* arg, struct tcp_pcb* pcb, u16_t len) {
 
   bool keep_connection = connection->onSent(len);
   if (!keep_connection) {
-    tcp_arg(pcb, nullptr);
-    connection->onClose();
-
-    if (tcp_close(pcb) != ERR_OK) {
-      tcp_abort(pcb);
-      return ERR_ABRT;
-    }
+    return finish_connection(connection, pcb);
   }
 
   return ERR_OK;
@@ -87,19 +88,18 @@ err_t on_poll(void* arg, struct tcp_pcb* pcb) {
   }
 
   ClientConnection* connection = (ClientConnection*)arg;
-  if (connection->isClosing()) {
-    tcp_arg(pcb, nullptr);
+  connection->onPoll();
+  if (connection->shouldReap()) {
+    connection->detachAndAbort();
     connection->onClose();
-
     DEBUG("aborting inactive connection after close request");
-    tcp_abort(pcb);
     return ERR_ABRT;
   }
 
   return ERR_OK;
 }
 
-void on_error(void* arg, err_t err) {
+void on_error(void* arg, [[maybe_unused]] err_t err) {
   cyw43_arch_lwip_check();
 
   DEBUG("connection errored %s: %d", arg ? "with arg" : "without arg", (int)err);
@@ -172,6 +172,25 @@ struct tcp_pcb* init_listen_pcb(uint16_t port, void* arg) {
 
 } // namespace
 
+WebSocketServerInternal::~WebSocketServerInternal() {
+  Cyw43Guard guard;
+  for (auto& entry : connection_by_id)
+    entry.second->detachAndAbort();
+  if (listen_pcb) {
+    tcp_arg(listen_pcb, nullptr);
+    tcp_accept(listen_pcb, nullptr);
+    if (tcp_close(listen_pcb) != ERR_OK)
+      tcp_abort(listen_pcb);
+  }
+}
+
+void WebSocketServerInternal::setTcpNoDelay(bool enabled) {
+  Cyw43Guard guard;
+  tcp_nodelay = enabled;
+  for (auto& entry : connection_by_id)
+    entry.second->setTcpNoDelay(enabled);
+}
+
 bool WebSocketServerInternal::startListening(uint16_t port) {
   Cyw43Guard guard;
 
@@ -188,12 +207,58 @@ bool WebSocketServerInternal::startListening(uint16_t port) {
   return listen_pcb != nullptr;
 }
 
+bool WebSocketServerInternal::setReceiveLimits(const WebSocketServer::ReceiveLimits& limits) {
+  Cyw43Guard guard;
+  if (listen_pcb || !limits.messageBytes || limits.messageBytes > 64000 ||
+      limits.queuedBytes < limits.messageBytes || !limits.queuedMessages ||
+      !limits.dispatchMessages) {
+    DEBUG("invalid receive limits or listener already started");
+    return false;
+  }
+  receive_limits = limits;
+  return true;
+}
+
 void WebSocketServerInternal::popMessages() {
   Cyw43Guard guard;
+  if (dispatching)
+    return;
+  dispatching = true;
 
-  for (const auto& [_, conn] : connection_by_id) {
-    conn->popMessages();
+  for (auto it = connection_by_id.begin(); it != connection_by_id.end();) {
+    ClientConnection* connection = (it++)->second.get();
+    if (connection->isProcessing())
+      continue;
+    if (!connection->shouldReap())
+      connection->popMessages();
+    if (connection->shouldReap()) {
+      connection->detachAndAbort();
+      connection->onClose();
+    }
   }
+  dispatching = false;
+}
+
+WebSocketServer::SendResult WebSocketServerInternal::enqueueMessage(uint32_t conn_id, const void* payload, size_t size) {
+  Cyw43Guard guard;
+  ClientConnection* connection = getConnectionById(conn_id);
+  return connection ? connection->enqueueWebSocketMessage(payload, size)
+                    : WebSocketServer::SendResult::closed;
+}
+
+bool WebSocketServerInternal::flush(uint32_t conn_id) {
+  Cyw43Guard guard;
+  ClientConnection* connection = getConnectionById(conn_id);
+  return connection && connection->flushSend();
+}
+
+bool WebSocketServerInternal::abort(uint32_t conn_id) {
+  Cyw43Guard guard;
+  ClientConnection* connection = getConnectionById(conn_id);
+  if (!connection)
+    return false;
+  connection->abort();
+  return true;
 }
 
 bool WebSocketServerInternal::sendPing(uint32_t conn_id, const void* payload, size_t payload_size) {
@@ -247,11 +312,11 @@ bool WebSocketServerInternal::broadcastMessage(const char* payload) {
     return false;
   }
 
-  for (const auto& [_, connection] : connection_by_id) {
-    connection->sendWebSocketMessage(payload);
-  }
-
-  return true;
+  bool all_success = true;
+  for (const auto& [_, connection] : connection_by_id)
+    if (!connection->sendWebSocketMessage(payload))
+      all_success = false;
+  return all_success;
 }
 
 bool WebSocketServerInternal::broadcastMessage(const void* payload, size_t payload_size) {
@@ -298,9 +363,13 @@ ClientConnection* WebSocketServerInternal::onConnect(struct tcp_pcb* pcb) {
     tcp_nagle_disable(pcb);
   }
 
-  auto connection = std::make_unique<ClientConnection>(*this, pcb);
+  auto connection = std::make_unique<ClientConnection>(*this, pcb, receive_limits);
   ClientConnection* connection_ptr = connection.get();
-  uint32_t conn_id = getConnectionId(connection_ptr);
+  do {
+    if (++next_connection_id > INT32_MAX)
+      next_connection_id = 1;
+  } while (connection_by_id.count(next_connection_id));
+  uint32_t conn_id = next_connection_id;
 
   connection_by_id[conn_id] = std::move(connection);
 
@@ -319,12 +388,11 @@ void WebSocketServerInternal::onClose(ClientConnection* connection, bool is_upgr
   cyw43_arch_lwip_check();
 
   uint32_t conn_id = getConnectionId(connection);
+  auto owned_connection = connection_by_id.extract(conn_id);
 
   if (is_upgraded && close_cb) {
     close_cb(server, conn_id);
   }
-
-  connection_by_id.erase(conn_id);
 }
 
 void WebSocketServerInternal::onMessage(ClientConnection* connection, const void* payload, size_t size) {
@@ -344,8 +412,10 @@ void WebSocketServerInternal::onPong(ClientConnection* connection, const void* p
 }
 
 uint32_t WebSocketServerInternal::getConnectionId(ClientConnection* connection) {
-  // Use the connection instance address as a unique ID
-  return (uint32_t)connection;
+  for (const auto& entry : connection_by_id)
+    if (entry.second.get() == connection)
+      return entry.first;
+  return 0;
 }
 
 ClientConnection* WebSocketServerInternal::getConnectionById(uint32_t conn_id) {

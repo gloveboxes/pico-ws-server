@@ -24,14 +24,6 @@ uint16_t read_u16_big_endian(uint8_t* source) {
   return ((uint16_t)source[0] << 8) | (uint16_t)source[1];
 }
 
-uint32_t read_u32_big_endian(uint8_t* source) {
-  return
-    ((uint32_t)source[0] << 24) |
-    ((uint32_t)source[1] << 16) |
-    ((uint32_t)source[2] << 8) |
-    ((uint32_t)source[3]);
-}
-
 uint64_t read_u64_big_endian(uint8_t* source) {
   return
     ((uint64_t)source[0] << 56) |
@@ -76,23 +68,6 @@ bool isMasked(uint8_t* header) {
   return header[1] & MASK_BIT_MASK;
 }
 
-uint32_t getMask(uint8_t* header) {
-  if (!isMasked(header)) {
-    return 0;
-  }
-
-  size_t offset = MIN_HEADER_LEN;
-  uint8_t pre_len = getPreLen(header);
-  if (pre_len == PRE_LEN_EX2) {
-    offset += 2;
-  }
-  if (pre_len == PRE_LEN_EX8) {
-    offset += 8;
-  }
-
-  return read_u32_big_endian(&header[offset]);
-}
-
 size_t getPayloadSize(uint8_t* header, size_t max) {
   uint64_t len = getPreLen(header);
 
@@ -111,48 +86,58 @@ size_t getPayloadSize(uint8_t* header, size_t max) {
 } // namespace
 
 bool WebSocketFrameBuilder::process(uint8_t byte) {
-  bool consumed = false;
-  if (!isHeaderComplete()) {
-    header[header_bytes++] = byte;
-    consumed = true;
-    if (!isHeaderComplete()) {
-      return true;
+  return process(&byte, 1);
+}
+
+bool WebSocketFrameBuilder::process(const uint8_t* data, size_t size) {
+  while (size) {
+    if (!reading_payload) {
+      header[header_bytes++] = *data++;
+      --size;
+      if (header_bytes == MIN_HEADER_LEN) {
+        if ((header[0] & 0x70) || !isMasked(header))
+          return false;
+        uint8_t length = getPreLen(header);
+        header_size = MIN_HEADER_LEN + 4 +
+                      (length == PRE_LEN_EX2 ? 2 : length == PRE_LEN_EX8 ? 8 : 0);
+      }
+      if (header_bytes < header_size)
+        continue;
+      if (!decodeHeader())
+        return false;
+      reading_payload = true;
+    }
+    size_t remaining = payload_size - frame.getPayloadSize();
+    size_t count = size < remaining ? size : remaining;
+    frame.append(data, count, mask);
+    data += count;
+    size -= count;
+    if (frame.getPayloadSize() == payload_size) {
+      header_bytes = 0;
+      header_size = MIN_HEADER_LEN;
+      reading_payload = false;
+      if (!message_builder.processFrame(frame))
+        return false;
     }
   }
+  return true;
+}
 
-  if (!isMasked(header)) {
-    // Frames from client must be masked
+bool WebSocketFrameBuilder::decodeHeader() {
+  payload_size = getPayloadSize(header, MAX_PAYLOAD_SIZE);
+  if (payload_size == SIZE_MAX)
     return false;
-  }
-  size_t payload_size = getPayloadSize(header, MAX_PAYLOAD_SIZE);
-  if (payload_size == SIZE_MAX) {
-    // Unsupported payload size
+  uint8_t length = getPreLen(header);
+  if ((length == PRE_LEN_EX2 && payload_size < 126) ||
+      (length == PRE_LEN_EX8 && payload_size <= UINT16_MAX))
     return false;
-  }
-
-  if (!frame) {
-    frame = std::make_unique<WebSocketFrame>(getOpcode(header), isFinal(header), payload_size);
-  }
-
-  // Only append byte to payload if:
-  // 1. The byte wasn't consumed by header parsing
-  // 2. The frame actually has a payload (payload_size > 0)
-  // Without the payload_size check, 0-length frames (like CLOSE) would incorrectly
-  // append the first byte of the next frame to their payload
-  if (!consumed && payload_size > 0) {
-    frame->append(byte);
-    consumed = true;
-  }
-
-  if (frame->getPayloadSize() < payload_size) {
-    return true;
-  }
-
-  frame->maskPayload(getMask(header));
-
-  // Reset and process completed frame
-  header_bytes = 0;
-  return message_builder.processFrame(std::move(frame));
+  uint8_t opcode = getOpcode(header);
+  if (!message_builder.acceptFrame(opcode, isFinal(header), payload_size))
+    return false;
+  for (size_t i = 0; i < 4; ++i)
+    mask[i] = header[header_size - 4 + i];
+  frame.reset(opcode, isFinal(header), payload_size);
+  return true;
 }
 
 size_t WebSocketFrameBuilder::makeHeader(bool final, uint8_t opcode, size_t payload_size, uint8_t header_out[MAX_HEADER_SIZE]) {
@@ -172,25 +157,4 @@ size_t WebSocketFrameBuilder::makeHeader(bool final, uint8_t opcode, size_t payl
   }
 
   return header_len;
-}
-
-bool WebSocketFrameBuilder::isHeaderComplete() {
-  size_t bytes_needed = MIN_HEADER_LEN;
-  if (header_bytes < bytes_needed) {
-    return false;
-  }
-
-  uint8_t pre_len = getPreLen(header);
-  if (pre_len == PRE_LEN_EX2) {
-    bytes_needed += 2;
-  }
-  if (pre_len == PRE_LEN_EX8) {
-    bytes_needed += 8;
-  }
-
-  if (isMasked(header)) {
-    bytes_needed += 4;
-  }
-
-  return header_bytes >= bytes_needed;
 }

@@ -10,6 +10,13 @@ class WebSocketServerInternal;
 // Not multicore safe
 class WebSocketServer {
  public:
+  enum class SendResult { queued, would_block, closed, invalid, too_large, no_memory, error };
+  struct ReceiveLimits {
+    size_t messageBytes = 64000;
+    size_t queuedBytes = 64000;
+    size_t queuedMessages = 16;
+    size_t dispatchMessages = 8;
+  };
   typedef void (*ConnectCallback)(WebSocketServer& server, uint32_t conn_id);
   // Note: data can be treated as a null-terminated string if expecting TEXT messages (an extra NULL byte is allocated)
   typedef void (*MessageCallback)(WebSocketServer& server, uint32_t conn_id, const void *data, size_t len);
@@ -39,11 +46,20 @@ class WebSocketServer {
   // Call this before startListening() or after connections are established.
   // Default is false (Nagle's algorithm enabled).
   void setTcpNoDelay(bool enabled);
+  // Set before listening. Oversize messages or queue overflow disconnect the
+  // peer rather than silently losing bytes. Control frames retain RFC limits.
+  bool setReceiveLimits(const ReceiveLimits& limits);
 
-  // Send a TEXT message, payload must be a null-terminated string
+  // Immediate send attempts a flush and returns TCP enqueue success, not peer
+  // delivery. Accepted bytes are retried internally after a flush failure.
+  // Send a TEXT message, payload must be a null-terminated string.
   bool sendMessage(uint32_t conn_id, const char* payload);
   // Send a BINARY message
   bool sendMessage(uint32_t conn_id, const void* payload, size_t payload_size);
+  // Queue one complete binary frame without flushing. Only queued transfers
+  // ownership to TCP; retry would_block after servicing the network.
+  SendResult enqueueMessage(uint32_t conn_id, const void* payload, size_t payload_size);
+  bool flush(uint32_t conn_id);
   // Send a PING control frame, optional payload echoed back in PONG (up to 125 bytes per RFC)
   bool sendPing(uint32_t conn_id, const void* payload = nullptr, size_t payload_size = 0);
 
@@ -53,9 +69,11 @@ class WebSocketServer {
   bool broadcastMessage(const void* payload, size_t payload_size);
 
   // Begin closing the specified connection.
-  // Note: it is still possible for messages to be received on a closing connection,
-  // but no further messages may be sent.
+  // No further application messages are dispatched or sent. Cleanup occurs
+  // after a one-second grace period even if the close frame cannot be queued.
   bool close(uint32_t conn_id);
+  // Request unconditional teardown at the next popMessages(), safe in callbacks.
+  bool abort(uint32_t conn_id);
 
  private:
   std::unique_ptr<WebSocketServerInternal> internal;

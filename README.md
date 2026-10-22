@@ -84,10 +84,10 @@ int main() {
     return 1;
   }
   
-  // 6. Main loop - must call cyw43_arch_poll() or popMessages() regularly
+  // 6. Main loop for pico_cyw43_arch_lwip_poll: call both regularly
   while (1) {
     cyw43_arch_poll();  // When using pico_cyw43_arch_lwip_poll
-    // or call server.popMessages() if using threadsafe background
+    server.popMessages();
   }
 }
 ```
@@ -172,6 +172,22 @@ All callbacks receive a `WebSocketServer&` reference and `conn_id` to identify t
 
 ### Sending Messages
 
+`sendMessage`, `sendPing` and broadcasts return **TCP enqueue success**, not
+delivery or flush success. Once `tcp_write` accepts a complete frame, a failed
+`tcp_output` leaves it owned by TCP. The library retries output from sent/poll
+callbacks and `popMessages()` without enqueueing another copy. This replaces
+the previous ambiguous `false` on accepted-write/failed-flush behaviour.
+Application-level consumption acknowledgements remain the application's job.
+
+For bursts, use `enqueueMessage(id, data, size)` for each binary frame, then
+`flush(id)` once. Interactive `sendMessage` and control traffic attempt an
+immediate flush. Enqueue returns `SendResult::queued`, `would_block`, `closed`,
+`invalid`, `too_large`, `no_memory`, or `error`. Only `queued` transfers bytes
+to TCP; only `would_block` indicates retryable write backpressure. A failed
+flush never authorises resubmitting accepted frames. Fatal transport errors
+schedule teardown. Frames remain contiguous, single-copy `tcp_write` calls;
+frames exceeding the configured `TCP_SND_BUF` cannot be queued atomically.
+
 #### Unicast (Single Connection)
 - **`bool sendMessage(uint32_t conn_id, const char* payload)`**  
   Send a TEXT message. `payload` must be a null-terminated string. Returns `true` on success.
@@ -191,7 +207,35 @@ All callbacks receive a `WebSocketServer&` reference and `conn_id` to identify t
 
 ### Connection Management
 - **`bool close(uint32_t conn_id)`**  
-  Begin graceful shutdown of the specified connection. Messages may still be received on a closing connection, but no further messages can be sent. Returns `true` on success.
+  Begin graceful shutdown, stopping application dispatch and sends. Returns whether
+  the close frame was accepted (or closing already began). Closing state is set
+  even if the write fails. A one-second grace deadline bounds reclamation, checked
+  by `popMessages()` and the approximately 500 ms TCP poll callback.
+
+- **`bool abort(uint32_t conn_id)`**
+  Request unconditional teardown at the next safe `popMessages()`/TCP poll
+  boundary. Safe from connect, message and PONG callbacks; it never deletes
+  the connection while parsing or dispatching its callback. Close notification
+  occurs once and the slot is reusable. Destruction detaches all callbacks and
+  releases clients/listener without user notifications; destroy the server only
+  outside callbacks while its CYW43 context remains usable.
+
+### Receive Limits
+
+Call `setReceiveLimits({messageBytes, queuedBytes, queuedMessages, dispatchMessages})`
+before listening. Invalid settings or changes after listening return `false`.
+Defaults are 64,000 message bytes, 64,000 queued payload bytes, 16 queued messages,
+and eight callbacks per connection per `popMessages()` call. The incomplete frame
+and fragmented message are also bounded by `messageBytes`; control frames retain
+the RFC 125-byte limit. Size/count overflow closes the connection with a diagnostic
+when `DEBUG_PRINT` is enabled, rather than silently dropping application bytes.
+These are payload limits, not a total heap budget: vector capacity, NUL terminators,
+partial frames and transport/container overhead also consume memory.
+
+PING replies are immediate when possible. One pending PONG (up to 125 bytes)
+survives TCP backpressure and is retried without duplicate enqueue; another PING
+before that pending reply fits closes the overloaded connection. PONG notifications,
+like message callbacks, are dispatched by `popMessages()`, not the receive callback.
 
 ### TCP Options
 - **`void setTcpNoDelay(bool enabled)`**  
@@ -199,8 +243,16 @@ All callbacks receive a `WebSocketServer&` reference and `conn_id` to identify t
   Call this before `startListening()` or after connections are established.
 
 ## Performance Notes
-No benchmarking has been done, but this server is expected to have a small memory footprint and low response latency. However, there is likely room for performance improvement when it comes to processing large payloads.
+HTTP and WebSocket receive paths traverse pbuf spans once. Frame headers are
+decoded once; masking is applied during the payload copy. Ordinary final messages
+move their payload buffer directly into the bounded queue, retaining the text
+callback's extra NUL without a frame list or second payload copy. Fragmented
+messages support interleaved PING/PONG controls and enforce continuation ordering.
+HTTP content is flushed once per available burst and remains alive until its last
+byte is acknowledged, including backpressure before the first body chunk.
 
-Some low hanging fruit for future improvement:
-* Process payload bytes in bulk
-* Provide interface to consume chunked messages, without copying into a continuous buffer
+Host regressions in the consuming Z80ROMlessSBC project compile all server sources
+against fake lwIP and real Mbed TLS. They verify exact TCP write/flush counts,
+buffer ownership, split/chained input, queue limits, fairness and teardown.
+These tests do not establish physical Wi-Fi throughput or latency; see
+[validation notes](LATENCY_OPTIMIZATIONS.md).

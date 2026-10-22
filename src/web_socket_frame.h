@@ -2,12 +2,19 @@
 #define __WEB_SOCKET_FRAME_H__
 
 #include <cstddef>
+#include <cstdint>
+#include <utility>
 #include <vector>
 
 class WebSocketFrame {
  public:
-  WebSocketFrame(uint8_t opcode, bool final, size_t capacity) : opcode(opcode), final(final) {
-    payload.reserve(capacity);
+  WebSocketFrame() = default;
+
+  void reset(uint8_t new_opcode, bool new_final, size_t capacity) {
+    opcode = new_opcode;
+    final = new_final;
+    payload.clear();
+    payload.reserve(capacity + 1);
   }
 
   uint8_t getOpcode() {
@@ -17,21 +24,14 @@ class WebSocketFrame {
     return final;
   }
 
-  void append(uint8_t byte) {
-    payload.push_back(byte);
+  void append(const uint8_t* data, size_t size, const uint8_t* mask) {
+    size_t offset = payload.size();
+    payload.resize(offset + size);
+    for (size_t i = 0; i < size; ++i)
+      payload[offset + i] = data[i] ^ mask[(offset + i) & 3];
   }
 
-  void maskPayload(uint32_t mask) {
-    uint8_t big_endian[4];
-    big_endian[0] = (mask >> 24) & 0xFF;
-    big_endian[1] = (mask >> 16) & 0xFF;
-    big_endian[2] = (mask >> 8) & 0xFF;
-    big_endian[3] = mask & 0xFF;
-    for (size_t i = 0; i < payload.size(); i++) {
-      payload[i] ^= big_endian[i % 4];
-    }
-  }
-
+  std::vector<uint8_t> takePayload() { return std::move(payload); }
   size_t getPayloadSize() {
     return payload.size();
   }
@@ -40,8 +40,8 @@ class WebSocketFrame {
   }
 
  private:
-  uint8_t opcode;
-  bool final;
+  uint8_t opcode = 0;
+  bool final = false;
   std::vector<uint8_t> payload;
 };
 

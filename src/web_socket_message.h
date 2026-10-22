@@ -2,10 +2,7 @@
 #define __WEB_SOCKET_MESSAGE_H__
 
 #include <cstddef>
-#include <list>
-#include <memory>
 #include <stdint.h>
-#include <string.h>
 #include <vector>
 
 #include "web_socket_frame.h"
@@ -22,7 +19,7 @@ class WebSocketMessage {
   };
 
   WebSocketMessage(Type type, const void* payload, size_t payload_size)
-      : type(type), const_payload((uint8_t*)payload), payload_size(payload_size) {}
+      : type(type), payload_size(payload_size), const_payload(static_cast<const uint8_t*>(payload)) {}
 
   WebSocketMessage(WebSocketMessage&& from)
       : type(from.type),
@@ -38,26 +35,9 @@ class WebSocketMessage {
     return *this;
   }
 
-  explicit WebSocketMessage(const std::list<std::unique_ptr<WebSocketFrame>>& frames) {
-    for (const auto& frame : frames) {
-      payload_size += frame->getPayloadSize();
-    }
-
-    payload.resize(payload_size + 1);
-
-    size_t payload_filled = 0;
-    for (const auto& frame : frames) {
-      Type frame_type = opcodeToType(frame->getOpcode());
-      if (frame_type != UNKNOWN) {
-        type = frame_type;
-      }
-
-      memcpy(&payload[payload_filled], frame->getPayload(), frame->getPayloadSize());
-      payload_filled += frame->getPayloadSize();
-    }
-
-    // Null terminator to allow payloads to be treated as strings
-    payload[payload_size] = 0;
+  WebSocketMessage(Type type, std::vector<uint8_t>&& bytes)
+      : type(type), payload_size(bytes.size()), payload(std::move(bytes)) {
+    payload.push_back(0);
   }
 
   Type getType() const {
@@ -80,22 +60,6 @@ class WebSocketMessage {
   std::vector<uint8_t> payload;
   const uint8_t* const_payload = nullptr;
 
-  Type opcodeToType(uint8_t opcode) {
-    switch (opcode) {
-    case TEXT:
-      return TEXT;
-    case BINARY:
-      return BINARY;
-    case CLOSE:
-      return CLOSE;
-    case PING:
-      return PING;
-    case PONG:
-      return PONG;
-    default:
-      return UNKNOWN;
-    }
-  }
 };
 
 #endif

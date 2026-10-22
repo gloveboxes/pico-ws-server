@@ -9,32 +9,45 @@
 #include "web_socket_message.h"
 
 bool WebSocketHandler::process(struct pbuf* pb) {
-  for (size_t i = 0; i < pb->tot_len; i++) {
-    char c = pbuf_get_at(pb, i);
-    if (!message_builder.process(c)) {
-      // Attempt a graceful disconnect, but set is_closing regardless
-      close();
-      is_closing = true;
+  if (is_closing)
+    return false;
+  for (const pbuf* span = pb; span; span = span->next) {
+    if (!process(static_cast<const uint8_t*>(span->payload), span->len))
       return false;
-    }
   }
   return true;
+}
+
+bool WebSocketHandler::process(const uint8_t* data, size_t size) {
+  if (is_closing)
+    return false;
+  if (message_builder.process(data, size))
+    return true;
+  close();
+  return false;
 }
 
 bool WebSocketHandler::sendRaw(const void* data, size_t size) {
   return connection.sendRaw(data, size);
 }
 
+WebSocketServer::SendResult WebSocketHandler::enqueueRaw(const void* data, size_t size) {
+  return connection.enqueueRaw(data, size);
+}
+
 bool WebSocketHandler::flushSend() {
   return connection.flushSend();
+}
+
+size_t WebSocketHandler::maxMessageBytes() const {
+  return connection.maxMessageBytes();
 }
 
 bool WebSocketHandler::processMessage(WebSocketMessage&& message) {
   switch (message.getType()) {
   case WebSocketMessage::TEXT:
   case WebSocketMessage::BINARY:
-    connection.processWebSocketMessage(std::move(message));
-    return true;
+    return connection.processWebSocketMessage(std::move(message));
 
   case WebSocketMessage::CLOSE:
     if (!is_closing) {
@@ -46,12 +59,11 @@ bool WebSocketHandler::processMessage(WebSocketMessage&& message) {
 
   case WebSocketMessage::PING:
     DEBUG("PING requested");
-    return sendMessage(WebSocketMessage(WebSocketMessage::PONG, message.getPayload(), message.getPayloadSize()));
+    return connection.sendWebSocketPong(message.getPayload(), message.getPayloadSize());
 
   case WebSocketMessage::PONG:
     DEBUG("PONG received");
-    connection.processWebSocketPong(message.getPayload(), message.getPayloadSize());
-    return true;
+    return connection.processWebSocketMessage(std::move(message));
 
   default:
     // Ignore unknown message types
@@ -68,15 +80,18 @@ bool WebSocketHandler::sendMessage(const WebSocketMessage& message) {
   return message_builder.sendMessage(message);
 }
 
+WebSocketServer::SendResult WebSocketHandler::enqueueMessage(const WebSocketMessage& message) {
+  if (is_closing)
+    return WebSocketServer::SendResult::closed;
+  return message_builder.enqueueMessage(message);
+}
+
 bool WebSocketHandler::close() {
   if (is_closing) {
     return true;
   }
 
-  if (!message_builder.sendMessage(WebSocketMessage(WebSocketMessage::CLOSE, nullptr, 0))) {
-    return false;
-  }
-
+  bool queued = message_builder.sendMessage(WebSocketMessage(WebSocketMessage::CLOSE, nullptr, 0));
   is_closing = true;
-  return true;
+  return queued;
 }

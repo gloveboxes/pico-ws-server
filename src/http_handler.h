@@ -13,10 +13,10 @@ class HTTPHandler {
  public:
   HTTPHandler(ClientConnection& connection) : connection(connection) {}
 
-  bool process(struct pbuf* pb);
+  bool process(struct pbuf* pb, size_t& consumed);
   bool isUpgraded() { return is_upgraded; }
   bool isClosing() { return is_closing; }
-  bool needsSentCallback() const { return serving_static_html && !is_upgraded; }
+  bool needsSentCallback() const { return response_committed && !is_upgraded; }
   bool onSent(uint16_t len);
 
  private:

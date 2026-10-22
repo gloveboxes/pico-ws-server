@@ -19,7 +19,6 @@ namespace {
 
 static constexpr auto MAX_REQUEST_SIZE = 4096;
 
-static constexpr auto HEADER_BUF_SIZE = 64;
 static constexpr const char EXPECTED_METHOD[] = "GET ";
 static constexpr const char EXPECTED_PATH[] = "/ ";
 static constexpr const char EXPECTED_PROTOCOL[] = "HTTP/1.1\r\n";
@@ -65,32 +64,29 @@ static constexpr const char UPGRADE_RESPONSE_ACCEPT_PREFIX[] =
 static constexpr const char UPGRADE_RESPONSE_END[] =
   "\r\n\r\n";
 
-void decode_hex(const char* hex, uint8_t* out) {
-  size_t i_out = 0;
-  char hex_byte[3] = {0};
-  for (size_t i = 0; hex[i] && hex[i + 1]; i += 2) {
-    hex_byte[0] = hex[i];
-    hex_byte[1] = hex[i + 1];
-    out[i_out++] = strtol(hex_byte, nullptr, 16);
-  }
-}
-
 } // namespace
 
-bool HTTPHandler::process(struct pbuf* pb) {
+bool HTTPHandler::process(struct pbuf* pb, size_t& consumed) {
+  consumed = 0;
   if (is_closing) {
     return false;
   }
+  if (response_committed)
+    return true;
 
-  for (size_t i = 0; i < pb->tot_len; i++) {
-    char c = pbuf_get_at(pb, i);
-    bool sent_response;
-    if (!process(c, &sent_response)) {
-      if (!sent_response) {
-        sendString(BAD_REQUEST_RESPONSE);
+  for (const pbuf* span = pb; span; span = span->next) {
+    const char* bytes = static_cast<const char*>(span->payload);
+    for (size_t i = 0; i < span->len; ++i) {
+      ++consumed;
+      bool sent_response = false;
+      if (!process(bytes[i], &sent_response)) {
+        if (!sent_response)
+          sendString(BAD_REQUEST_RESPONSE);
+        is_closing = true;
+        return false;
       }
-      is_closing = true;
-      return false;
+      if (is_upgraded || response_committed)
+        return true;
     }
   }
   return true;
@@ -139,21 +135,18 @@ bool HTTPHandler::sendHTMLChunks() {
     return true;
   }
 
-  bool sent_any = false;
   while (static_html_offset < static_html_gz_len) {
     size_t remaining = static_html_gz_len - static_html_offset;
     size_t chunk = remaining < HTML_CHUNK_SIZE ? remaining : HTML_CHUNK_SIZE;
-    if (!send(static_html_gz + static_html_offset, chunk)) {
-      if (!sent_any) {
+    auto result = connection.enqueueRaw(static_html_gz + static_html_offset, chunk);
+    if (result != WebSocketServer::SendResult::queued) {
+      if (result != WebSocketServer::SendResult::would_block)
         return false;
-      }
-      connection.flushSend();
       break;
     }
-    sent_any = true;
     static_html_offset += chunk;
-    connection.flushSend();
   }
+  connection.flushSend();
 
   if (static_html_offset >= static_html_gz_len) {
     serving_static_html = false;
@@ -187,12 +180,12 @@ bool HTTPHandler::attemptUpgrade(bool* sent_response) {
     ws_key_header_value);
   if (!has_upgrade_header && !has_connection_header && !has_ws_version_header) {
     // Not a WebSocket request, serve static HTML
-    if (!sendHTML()) {
+    bool sent = sendHTML();
+    if (!sent) {
       DEBUG("failed to send HTML response");
     }
     *sent_response = true;
-    // Return true if still sending chunks to keep connection alive
-    return serving_static_html;
+    return sent;
   }
 
   if (!has_upgrade_header || !has_connection_header || !has_ws_version_header) {
@@ -293,7 +286,7 @@ bool HTTPHandler::process(char c, bool *sent_response) {
       // attemptUpgrade returns true for WebSocket OR if still sending chunked HTML
       bool keep_alive = attemptUpgrade(sent_response);
       // Only set is_upgraded for actual WebSocket upgrades (not chunked HTML)
-      if (keep_alive && !serving_static_html) {
+      if (keep_alive && !response_committed) {
         is_upgraded = true;
       }
       return keep_alive;

@@ -15,23 +15,28 @@ class WebSocketServerInternal {
  public:
   WebSocketServerInternal(WebSocketServer& server, uint32_t max_connections)
       : server(server), max_connections(max_connections) {}
+  ~WebSocketServerInternal();
 
   void setConnectCallback(WebSocketServer::ConnectCallback cb) { connect_cb = cb; }
   void setCloseCallback(WebSocketServer::CloseCallback cb) { close_cb = cb; }
   void setMessageCallback(WebSocketServer::MessageCallback cb) { message_cb = cb; }
   void setPongCallback(WebSocketServer::PongCallback cb) { pong_cb = cb; }
-  void setTcpNoDelay(bool enabled) { tcp_nodelay = enabled; }
+  void setTcpNoDelay(bool enabled);
+  bool setReceiveLimits(const WebSocketServer::ReceiveLimits& limits);
 
   bool startListening(uint16_t port);
   void popMessages();
 
   bool sendMessage(uint32_t conn_id, const char* payload);
   bool sendMessage(uint32_t conn_id, const void* payload, size_t payload_size);
+  WebSocketServer::SendResult enqueueMessage(uint32_t conn_id, const void* payload, size_t size);
+  bool flush(uint32_t conn_id);
   bool sendPing(uint32_t conn_id, const void* payload, size_t payload_size);
   bool broadcastMessage(const char* payload);
   bool broadcastMessage(const void* payload, size_t payload_size);
 
   bool close(uint32_t conn_id);
+  bool abort(uint32_t conn_id);
 
   ClientConnection* onConnect(struct tcp_pcb* pcb);
   void onUpgrade(ClientConnection* connection);
@@ -44,7 +49,10 @@ class WebSocketServerInternal {
   WebSocketServer& server;
 
   uint32_t max_connections;
+  uint32_t next_connection_id = 0;
+  WebSocketServer::ReceiveLimits receive_limits;
   bool tcp_nodelay = false;
+  bool dispatching = false;
   WebSocketServer::ConnectCallback connect_cb = nullptr;
   WebSocketServer::MessageCallback message_cb = nullptr;
   WebSocketServer::CloseCallback close_cb = nullptr;

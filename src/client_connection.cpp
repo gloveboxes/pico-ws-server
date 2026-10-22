@@ -7,25 +7,61 @@
 #include "cyw43_config.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
+#include "lwip/sys.h"
 
 #include "web_socket_message.h"
 #include "web_socket_server_internal.h"
+#include "debug.h"
 
 void ClientConnection::popMessages() {
-  while (!message_queue.empty()) {
-    server.onMessage(this, message_queue.front().getPayload(), message_queue.front().getPayloadSize());
+  onPoll();
+  for (size_t count = 0; count < limits.dispatchMessages &&
+       !message_queue.empty() && !isClosing(); ++count) {
+    WebSocketMessage message(std::move(message_queue.front()));
     message_queue.pop();
+    queued_bytes -= message.getPayloadSize();
+    if (message.getType() == WebSocketMessage::PONG)
+      server.onPong(this, message.getPayload(), message.getPayloadSize());
+    else
+      server.onMessage(this, message.getPayload(), message.getPayloadSize());
   }
 }
 
+void ClientConnection::onPoll() {
+  retryPong();
+  flushSend();
+}
+
 bool ClientConnection::process(struct pbuf* pb) {
+  processing = true;
+  bool result = processData(pb);
+  processing = false;
+  return result;
+}
+
+bool ClientConnection::processData(struct pbuf* pb) {
+  if (abort_requested)
+    return false;
   bool result;
   if (http_handler.isUpgraded()) {
     result = ws_handler.process(pb);
   } else {
-    result = http_handler.process(pb);
-    if (http_handler.isUpgraded()) {
+    size_t consumed = 0;
+    result = http_handler.process(pb, consumed);
+    if (result && http_handler.isUpgraded()) {
       server.onUpgrade(this);
+      if (abort_requested)
+        return true;
+      for (const pbuf* span = pb; span; span = span->next) {
+        if (consumed >= span->len) {
+          consumed -= span->len;
+          continue;
+        }
+        if (!ws_handler.process(static_cast<const uint8_t*>(span->payload) + consumed,
+                                span->len - consumed))
+          return false;
+        consumed = 0;
+      }
     }
   }
 
@@ -33,48 +69,103 @@ bool ClientConnection::process(struct pbuf* pb) {
 }
 
 bool ClientConnection::sendRaw(const void* data, size_t size) {
+  return enqueueRaw(data, size) == WebSocketServer::SendResult::queued;
+}
+
+WebSocketServer::SendResult ClientConnection::enqueueRaw(const void* data, size_t size) {
   cyw43_arch_lwip_check();
-
-  if (!size) {
-    return true;
+  using Result = WebSocketServer::SendResult;
+  if (abort_requested || pcb == nullptr)
+    return Result::closed;
+  if (size > UINT16_MAX || size > TCP_SND_BUF)
+    return Result::too_large;
+  if (size && data == nullptr)
+    return Result::invalid;
+  if (!size)
+    return Result::queued;
+  err_t result = tcp_write(pcb, data, (u16_t)size, TCP_WRITE_FLAG_COPY);
+  if (result == ERR_MEM)
+    return Result::would_block;
+  if (result != ERR_OK) {
+    abort_requested = true;
+    return Result::error;
   }
-
-  // Note: unfortunately, we cannot easily determine whether ERR_MEM should be retryable here. It could be a
-  // transient problem that would resolve over time, e.g. if the remote side acks some data and frees up send buffer.
-  // Or, this payload (and the downstream structures needed) may be too large to ever fit in the LwIP pools.
-  //
-  // At best, we could return a "maybe retriable" status here, since we know some errors are permanent. However,
-  // this would add complexity, and would still leave callers with the burden of non-convergent retries.
-  //
-  // Use TCP_WRITE_FLAG_COPY to copy data, and omit TCP_WRITE_FLAG_MORE to signal this is complete data
-  // that should be pushed immediately (sets PSH flag)
-  return tcp_write(pcb, data, size, TCP_WRITE_FLAG_COPY) == ERR_OK;
+  flush_pending = true;
+  return Result::queued;
 }
 
 bool ClientConnection::flushSend() {
   cyw43_arch_lwip_check();
 
-  return tcp_output(pcb) == ERR_OK;
+  if (abort_requested || pcb == nullptr)
+    return false;
+  if (!flush_pending)
+    return true;
+  err_t result = tcp_output(pcb);
+  if (result == ERR_OK)
+    flush_pending = false;
+  else if (result != ERR_MEM && result != ERR_BUF && result != ERR_RTE)
+    abort_requested = true;
+  return result == ERR_OK;
 }
 
 bool ClientConnection::needsSentCallback() {
-  return http_handler.needsSentCallback();
+  return flush_pending || pong_pending || http_handler.needsSentCallback();
 }
 
 bool ClientConnection::onSent(uint16_t len) {
-  return http_handler.onSent(len);
+  retryPong();
+  flushSend();
+  return !abort_requested && http_handler.onSent(len);
 }
 
 void ClientConnection::onClose() {
+  abort_requested = true;
   server.onClose(this, http_handler.isUpgraded());
 }
 
 bool ClientConnection::isClosing() {
-  return http_handler.isClosing() || ws_handler.isClosing();
+  return abort_requested || http_handler.isClosing() || ws_handler.isClosing();
 }
 
-void ClientConnection::processWebSocketMessage(WebSocketMessage&& message) {
+bool ClientConnection::processWebSocketMessage(WebSocketMessage&& message) {
+  if (message_queue.size() >= limits.queuedMessages ||
+      message.getPayloadSize() > limits.queuedBytes - queued_bytes) {
+    DEBUG("WebSocket receive queue limit exceeded");
+    return false;
+  }
+  queued_bytes += message.getPayloadSize();
   message_queue.push(std::move(message));
+  return true;
+}
+
+bool ClientConnection::sendWebSocketPong(const void* payload, size_t size) {
+  if (pong_pending) {
+    DEBUG("WebSocket pending PONG limit exceeded");
+    return false;
+  }
+  memcpy(pong_payload.data(), payload, size);
+  pong_size = size;
+  pong_pending = true;
+  bool result = retryPong();
+  flushSend();
+  return result && !abort_requested;
+}
+
+bool ClientConnection::retryPong() {
+  if (!pong_pending)
+    return true;
+  auto result = ws_handler.enqueueMessage(
+      WebSocketMessage(WebSocketMessage::PONG, pong_payload.data(), pong_size));
+  if (result == WebSocketServer::SendResult::would_block)
+    return true;
+  if (result != WebSocketServer::SendResult::queued) {
+    DEBUG("WebSocket PONG enqueue failed");
+    abort_requested = true;
+    return false;
+  }
+  pong_pending = false;
+  return !abort_requested;
 }
 
 void ClientConnection::processWebSocketPong(const void* payload, size_t size) {
@@ -122,5 +213,30 @@ bool ClientConnection::close() {
     return false;
   }
 
+  if (!close_started) {
+    close_started = true;
+    close_deadline = sys_now() + 1000;
+  }
   return ws_handler.close();
+}
+
+bool ClientConnection::shouldReap() const {
+  return abort_requested ||
+         (close_started && static_cast<int32_t>(sys_now() - close_deadline) >= 0);
+}
+
+WebSocketServer::SendResult ClientConnection::enqueueWebSocketMessage(const void* payload, size_t size) {
+  if (!http_handler.isUpgraded() || abort_requested)
+    return WebSocketServer::SendResult::closed;
+  return ws_handler.enqueueMessage(WebSocketMessage(WebSocketMessage::BINARY, payload, size));
+}
+
+void ClientConnection::detachAndAbort() {
+  tcp_arg(pcb, nullptr);
+  tcp_recv(pcb, nullptr);
+  tcp_sent(pcb, nullptr);
+  tcp_err(pcb, nullptr);
+  tcp_poll(pcb, nullptr, 0);
+  tcp_abort(pcb);
+  pcb = nullptr;
 }

@@ -49,6 +49,22 @@ bool WebSocketServer::sendPing(uint32_t conn_id, const void* payload, size_t pay
   return internal->sendPing(conn_id, payload, payload_size);
 }
 
+WebSocketServer::SendResult WebSocketServer::enqueueMessage(uint32_t conn_id, const void* payload, size_t size) {
+  return internal->enqueueMessage(conn_id, payload, size);
+}
+
+bool WebSocketServer::flush(uint32_t conn_id) {
+  return internal->flush(conn_id);
+}
+
+bool WebSocketServer::setReceiveLimits(const ReceiveLimits& limits) {
+  return internal->setReceiveLimits(limits);
+}
+
+bool WebSocketServer::abort(uint32_t conn_id) {
+  return internal->abort(conn_id);
+}
+
 bool WebSocketServer::broadcastMessage(const char* payload) {
   return internal->broadcastMessage(payload);
 }

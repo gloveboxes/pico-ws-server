@@ -19,12 +19,16 @@ class WebSocketHandler {
   // Methods below must be called from lwIP-safe context
 
   bool process(struct pbuf* pb);
+  bool process(const uint8_t* data, size_t size);
+  size_t maxMessageBytes() const;
   bool sendRaw(const void* data, size_t size);
+  WebSocketServer::SendResult enqueueRaw(const void* data, size_t size);
   bool flushSend();
 
   bool processMessage(WebSocketMessage&& message);
 
   bool sendMessage(const WebSocketMessage& message);
+  WebSocketServer::SendResult enqueueMessage(const WebSocketMessage& message);
   bool close();
 
   bool isClosing() { return is_closing; }

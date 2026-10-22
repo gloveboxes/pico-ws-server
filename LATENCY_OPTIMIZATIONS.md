@@ -33,34 +33,21 @@ Nagle's algorithm buffers small packets to improve network efficiency, but cause
 
 ---
 
-### 2. Proper Error Propagation on Flush Failures
+### 2. Separate TCP Enqueue from Flush
 
 **Files Modified:**
 - `src/web_socket_message_builder.cpp`
 
 **Change:**
-Modified `sendMessage()` to return `false` when `flushSend()` fails, instead of silently logging and returning `true`.
+`enqueueMessage()` returns an explicit result. A complete accepted frame belongs
+to TCP, even if a subsequent `tcp_output()` fails. `sendMessage()` and `sendPing()`
+return enqueue success and attempt immediate output. They no longer report an
+ambiguous failure that could prompt the caller to enqueue a duplicate.
 
-**Before:**
-```cpp
-if (!handler.flushSend()) {
-    // TODO: does flushing need to be re-attempted later?
-    DEBUG("flushSend failed");
-}
-return true;  // Always returns true even if flush failed!
-```
-
-**After:**
-```cpp
-if (!handler.flushSend()) {
-    DEBUG("flushSend failed");
-    return false;  // Propagate error to caller
-}
-return true;
-```
-
-**Why:**
-When the TCP output buffer is full or `tcp_output()` fails, the data sits in lwIP's buffer and may not be transmitted. The caller needs to know this happened so they can log it, retry, or handle the error appropriately.
+For bursts, enqueue all accepted frames and call `flush()` once. Retry rejected
+`would_block` frames only; never resubmit accepted frames merely because output
+failed. Pending flushes are retried from sent/poll callbacks and `popMessages()`.
+Fatal errors schedule teardown. Peer consumption still requires application ACKs.
 
 ---
 
@@ -112,15 +99,40 @@ return tcp_write(pcb, data, size, TCP_WRITE_FLAG_COPY) == ERR_OK;
 ```
 
 **Why:**
-By NOT setting `TCP_WRITE_FLAG_MORE`, lwIP knows this is the end of the data segment and sets the PSH (push) flag in the TCP packet, instructing the receiver to deliver the data to the application immediately rather than waiting for more data.
+Each WebSocket frame uses one contiguous `TCP_WRITE_FLAG_COPY` write, preserving
+atomic enqueue and temporary-buffer lifetime safety. Omitting
+`TCP_WRITE_FLAG_MORE` supplies a push hint; it does not guarantee immediate peer
+delivery or override congestion/window limits. A 261-byte terminal application
+message plus its four-byte WebSocket header fits the existing 270-byte stack
+buffer, without a temporary heap frame.
+
+### 5. Bounded, Lower-Copy Receive and Teardown
+
+HTTP and WebSocket paths walk pbuf spans once rather than rescanning the chain
+for every byte. Header decode is cached, and payloads are unmasked while copying.
+Unfragmented payload vectors move into the dispatch queue, including their
+reserved NUL terminator, without per-frame heap objects or list nodes.
+Fragmented messages retain protocol validation and interleaved control frames.
+
+Receive message/queue limits and per-connection dispatch budgets bound service
+work; overflow disconnects explicitly. PING backpressure retains one bounded
+PONG, retried without duplicate enqueue. `abort()` defers teardown to a safe
+boundary, while graceful close has a one-second reclamation deadline and a
+roughly 500 ms TCP polling fallback. HTTP content remains alive through its
+final ACK and tolerates backpressure before the first body chunk.
 
 ---
 
 ## Performance Impact
 
-### Latency Improvements
-- **Without optimizations:** 50-200ms delays due to Nagle's algorithm and TCP buffering
-- **With optimizations:** ~1-10ms latency, mostly limited by WiFi/network conditions
+### Verified Host Behaviour
+- Four terminal output frames produce four 265-byte TCP writes and one flush.
+- Accepted frames survive transient output failures without duplicate enqueue.
+- Ordinary receive payload ownership transfers without a second payload copy.
+- Queue bounds, dispatch fairness and callback-safe slot reclamation are tested.
+
+These are functional/operation-count results, not hardware latency measurements.
+No physical Wi-Fi throughput or key-to-echo latency improvement is claimed.
 
 ### When to Use
 These optimizations are ideal for:
@@ -179,28 +191,27 @@ while (true) {
 
 To verify latency improvements:
 
-1. **Before optimizations:**
-   - Observe 50-200ms delays between output and browser display
-   - Character echoing feels sluggish
+The consuming Z80ROMlessSBC project's native `websocket_*` tests compile all
+server sources against fake lwIP and real SDK Mbed TLS. Configure native tests
+with `PICO_SDK_PATH` to enable them. They exercise exact write/output counts,
+write/flush errors, chained and split pbufs, empty and fragmented messages,
+interleaved controls, malformed frames, limits, callback reentrancy, wrapped
+close deadlines, slot reuse and HTTP backpressure/final acknowledgements.
 
-2. **After optimizations:**
-   - Near-instant character display (1-10ms)
-   - Responsive terminal feel
-   - Smooth scrolling during bulk output
-
-3. **Monitor for issues:**
-   - Check for "Send failed" messages indicating buffer exhaustion
-   - Watch for increased network utilization
-   - Verify stable operation under high load
+For hardware acceptance, record sustained terminal bytes/second, key-to-echo
+latency and maximum network-poll gap. Compare idle, disk reads, cached disk writes
+and flash commits separately. Check disconnect/reconnect under load and watch
+for explicit overflow/timeout diagnostics. Do not infer a disk bottleneck or
+latency target from host tests alone.
 
 ---
 
 ## Future Considerations
 
-1. **Adaptive buffering:** Dynamically adjust flush behavior based on send buffer availability
-2. **Send queue:** Implement application-level queue for failed sends with retry logic
-3. **Flow control:** Add back-pressure mechanism to slow down application when network can't keep up
-4. **Metrics:** Add counters for send failures, flush failures, and queue depths
+1. Add hardware-backed measurements before changing lwIP pools or window sizes.
+2. Keep application consumption ACKs separate from TCP enqueue/output state.
+3. Consider additional counters if live measurements show unexplained stalls;
+   avoid speculative zero-copy buffers and their lifetime complexity.
 
 ---
 

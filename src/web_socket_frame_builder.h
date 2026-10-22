@@ -2,7 +2,6 @@
 #define __WEB_SOCKET_FRAME_BUILDER_H__
 
 #include <cstddef>
-#include <memory>
 #include <stdint.h>
 
 #include "web_socket_frame.h"
@@ -17,6 +16,7 @@ class WebSocketFrameBuilder {
       : message_builder(message_builder) {}
 
   bool process(uint8_t byte);
+  bool process(const uint8_t* data, size_t size);
 
   size_t makeHeader(bool final, uint8_t opcode, size_t payload_size, uint8_t header_out[MAX_HEADER_SIZE]);
 
@@ -27,10 +27,13 @@ class WebSocketFrameBuilder {
 
   uint8_t header[MAX_HEADER_SIZE];
   size_t header_bytes = 0;
+  size_t header_size = 2;
+  size_t payload_size = 0;
+  bool reading_payload = false;
+  uint8_t mask[4] = {};
+  WebSocketFrame frame;
 
-  std::unique_ptr<WebSocketFrame> frame;
-
-  bool isHeaderComplete();
+  bool decodeHeader();
 };
 
 #endif
