@@ -151,6 +151,13 @@ All callbacks receive a `WebSocketServer&` reference and `conn_id` to identify t
   Called when a connection closes.  
   ⚠️ **Warning**: May be called from ISR context. Use caution with shared data and avoid acquiring mutexes.
 
+- **`void setCloseDetailsCallback(CloseDetailsCallback cb)`**
+  Optional callback invoked immediately before `setCloseCallback`. It reports
+  the library's close reason, lwIP transport error code when available, and
+  current/peak receive queue usage with configured limits. Queue overflow
+  distinguishes message-count and byte limits. It runs in the same context as
+  the close callback, so use atomic/shared-state handling if needed.
+
 #### Message Handling
 - **`void setMessageCallback(MessageCallback cb)`**  
   Callback signature: `void callback(WebSocketServer& server, uint32_t conn_id, const void* data, size_t len)`  
@@ -231,6 +238,8 @@ the RFC 125-byte limit. Size/count overflow closes the connection with a diagnos
 when `DEBUG_PRINT` is enabled, rather than silently dropping application bytes.
 These are payload limits, not a total heap budget: vector capacity, NUL terminators,
 partial frames and transport/container overhead also consume memory.
+`getReceiveQueueStats(conn_id, stats)` snapshots current and peak queued messages
+and payload bytes, together with the configured queue limits, for a live connection.
 
 PING replies are immediate when possible. One pending PONG (up to 125 bytes)
 survives TCP backpressure and is retried without duplicate enqueue; another PING

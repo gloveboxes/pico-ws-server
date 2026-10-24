@@ -41,11 +41,17 @@ err_t on_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* pb, err_t err) {
 
   bool keep_connection;
   if (pb) {
-    keep_connection = err == ERR_OK && connection->process(pb);
+    if (err != ERR_OK) {
+      connection->setCloseReason(WebSocketServer::CloseReason::tcp_error, err);
+      keep_connection = false;
+    } else {
+      keep_connection = connection->process(pb);
+    }
     tcp_recved(pcb, pb->tot_len);
     pbuf_free(pb);
   } else {
     keep_connection = false;
+    connection->setCloseReason(WebSocketServer::CloseReason::peer_tcp_closed);
     DEBUG("client disconnected");
   }
 
@@ -72,6 +78,7 @@ err_t on_sent(void* arg, struct tcp_pcb* pcb, u16_t len) {
 
   bool keep_connection = connection->onSent(len);
   if (!keep_connection) {
+    connection->setCloseReason(WebSocketServer::CloseReason::tcp_output_error);
     return finish_connection(connection, pcb);
   }
 
@@ -90,6 +97,7 @@ err_t on_poll(void* arg, struct tcp_pcb* pcb) {
   ClientConnection* connection = (ClientConnection*)arg;
   connection->onPoll();
   if (connection->shouldReap()) {
+    connection->markCloseTimeout();
     connection->detachAndAbort();
     connection->onClose();
     DEBUG("aborting inactive connection after close request");
@@ -105,7 +113,9 @@ void on_error(void* arg, [[maybe_unused]] err_t err) {
   DEBUG("connection errored %s: %d", arg ? "with arg" : "without arg", (int)err);
 
   if (arg) {
-    ((ClientConnection*)arg)->onClose();
+    ClientConnection* connection = (ClientConnection*)arg;
+    connection->setCloseReason(WebSocketServer::CloseReason::tcp_error, err);
+    connection->onClose();
   }
 }
 
@@ -219,6 +229,22 @@ bool WebSocketServerInternal::setReceiveLimits(const WebSocketServer::ReceiveLim
   return true;
 }
 
+bool WebSocketServerInternal::getReceiveQueueStats(
+    uint32_t conn_id, WebSocketServer::ReceiveQueueStats& stats) {
+  Cyw43Guard guard;
+  auto iter = connection_by_id.find(conn_id);
+  if (iter == connection_by_id.end())
+    return false;
+  const ClientConnection& connection = *iter->second;
+  stats.queuedMessages = connection.queuedMessages();
+  stats.queuedBytes = connection.queuedBytes();
+  stats.peakQueuedMessages = connection.peakQueuedMessages();
+  stats.peakQueuedBytes = connection.peakQueuedBytes();
+  stats.messageLimit = connection.queueMessageLimit();
+  stats.byteLimit = connection.queueByteLimit();
+  return true;
+}
+
 void WebSocketServerInternal::popMessages() {
   Cyw43Guard guard;
   if (dispatching)
@@ -232,6 +258,7 @@ void WebSocketServerInternal::popMessages() {
     if (!connection->shouldReap())
       connection->popMessages();
     if (connection->shouldReap()) {
+      connection->markCloseTimeout();
       connection->detachAndAbort();
       connection->onClose();
     }
@@ -388,10 +415,18 @@ void WebSocketServerInternal::onClose(ClientConnection* connection, bool is_upgr
   cyw43_arch_lwip_check();
 
   uint32_t conn_id = getConnectionId(connection);
+  auto reason = connection->closeReason();
+  int transport_error = connection->closeTransportError();
   auto owned_connection = connection_by_id.extract(conn_id);
 
-  if (is_upgraded && close_cb) {
-    close_cb(server, conn_id);
+  if (is_upgraded) {
+    if (close_details_cb)
+      close_details_cb(server, conn_id, reason, transport_error,
+                       connection->queuedMessages(), connection->queuedBytes(),
+                       connection->peakQueuedMessages(), connection->peakQueuedBytes(),
+                       connection->queueMessageLimit(), connection->queueByteLimit());
+    if (close_cb)
+      close_cb(server, conn_id);
   }
 }
 

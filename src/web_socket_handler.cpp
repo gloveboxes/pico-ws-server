@@ -23,6 +23,7 @@ bool WebSocketHandler::process(const uint8_t* data, size_t size) {
     return false;
   if (message_builder.process(data, size))
     return true;
+  connection.setCloseReason(WebSocketServer::CloseReason::invalid_websocket_input);
   close();
   return false;
 }
@@ -51,6 +52,7 @@ bool WebSocketHandler::processMessage(WebSocketMessage&& message) {
 
   case WebSocketMessage::CLOSE:
     if (!is_closing) {
+      connection.setCloseReason(WebSocketServer::CloseReason::peer_websocket_close);
       DEBUG("CLOSE requested");
       sendMessage(message);
       is_closing = true;

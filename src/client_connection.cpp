@@ -1,5 +1,6 @@
 #include "client_connection.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <string.h>
 #include <queue>
@@ -36,6 +37,8 @@ bool ClientConnection::process(struct pbuf* pb) {
   processing = true;
   bool result = processData(pb);
   processing = false;
+  if (!result)
+    setCloseReason(WebSocketServer::CloseReason::invalid_websocket_input);
   return result;
 }
 
@@ -87,6 +90,7 @@ WebSocketServer::SendResult ClientConnection::enqueueRaw(const void* data, size_
   if (result == ERR_MEM)
     return Result::would_block;
   if (result != ERR_OK) {
+    setCloseReason(WebSocketServer::CloseReason::tcp_write_error, result);
     abort_requested = true;
     return Result::error;
   }
@@ -104,8 +108,10 @@ bool ClientConnection::flushSend() {
   err_t result = tcp_output(pcb);
   if (result == ERR_OK)
     flush_pending = false;
-  else if (result != ERR_MEM && result != ERR_BUF && result != ERR_RTE)
+  else if (result != ERR_MEM && result != ERR_BUF && result != ERR_RTE) {
+    setCloseReason(WebSocketServer::CloseReason::tcp_output_error, result);
     abort_requested = true;
+  }
   return result == ERR_OK;
 }
 
@@ -129,9 +135,20 @@ bool ClientConnection::isClosing() {
 }
 
 bool ClientConnection::processWebSocketMessage(WebSocketMessage&& message) {
-  if (message_queue.size() >= limits.queuedMessages ||
-      message.getPayloadSize() > limits.queuedBytes - queued_bytes) {
-    DEBUG("WebSocket receive queue limit exceeded");
+  const size_t next_messages = message_queue.size() + 1;
+  const size_t next_bytes = queued_bytes + message.getPayloadSize();
+  peak_queued_messages = std::max(peak_queued_messages, next_messages);
+  peak_queued_bytes = std::max(peak_queued_bytes, next_bytes);
+  if (next_messages > limits.queuedMessages) {
+    setCloseReason(WebSocketServer::CloseReason::receive_queue_message_limit);
+    DEBUG("WebSocket receive queue message limit exceeded: %u/%u",
+          (unsigned)next_messages, (unsigned)limits.queuedMessages);
+    return false;
+  }
+  if (next_bytes > limits.queuedBytes) {
+    setCloseReason(WebSocketServer::CloseReason::receive_queue_byte_limit);
+    DEBUG("WebSocket receive queue byte limit exceeded: %u/%u",
+          (unsigned)next_bytes, (unsigned)limits.queuedBytes);
     return false;
   }
   queued_bytes += message.getPayloadSize();
@@ -141,6 +158,7 @@ bool ClientConnection::processWebSocketMessage(WebSocketMessage&& message) {
 
 bool ClientConnection::sendWebSocketPong(const void* payload, size_t size) {
   if (pong_pending) {
+    setCloseReason(WebSocketServer::CloseReason::pong_backpressure);
     DEBUG("WebSocket pending PONG limit exceeded");
     return false;
   }
@@ -160,6 +178,7 @@ bool ClientConnection::retryPong() {
   if (result == WebSocketServer::SendResult::would_block)
     return true;
   if (result != WebSocketServer::SendResult::queued) {
+    setCloseReason(WebSocketServer::CloseReason::pong_backpressure);
     DEBUG("WebSocket PONG enqueue failed");
     abort_requested = true;
     return false;
@@ -214,6 +233,7 @@ bool ClientConnection::close() {
   }
 
   if (!close_started) {
+    setCloseReason(WebSocketServer::CloseReason::local_close);
     close_started = true;
     close_deadline = sys_now() + 1000;
   }
@@ -223,6 +243,14 @@ bool ClientConnection::close() {
 bool ClientConnection::shouldReap() const {
   return abort_requested ||
          (close_started && static_cast<int32_t>(sys_now() - close_deadline) >= 0);
+}
+
+void ClientConnection::markCloseTimeout() {
+  if (!abort_requested && close_started &&
+      static_cast<int32_t>(sys_now() - close_deadline) >= 0 &&
+      (close_reason == WebSocketServer::CloseReason::local_close ||
+       close_reason == WebSocketServer::CloseReason::unknown))
+    close_reason = WebSocketServer::CloseReason::close_timeout;
 }
 
 WebSocketServer::SendResult ClientConnection::enqueueWebSocketMessage(const void* payload, size_t size) {

@@ -19,10 +19,15 @@ class WebSocketServerInternal {
 
   void setConnectCallback(WebSocketServer::ConnectCallback cb) { connect_cb = cb; }
   void setCloseCallback(WebSocketServer::CloseCallback cb) { close_cb = cb; }
+  void setCloseDetailsCallback(WebSocketServer::CloseDetailsCallback cb) {
+    close_details_cb = cb;
+  }
   void setMessageCallback(WebSocketServer::MessageCallback cb) { message_cb = cb; }
   void setPongCallback(WebSocketServer::PongCallback cb) { pong_cb = cb; }
   void setTcpNoDelay(bool enabled);
   bool setReceiveLimits(const WebSocketServer::ReceiveLimits& limits);
+  bool getReceiveQueueStats(uint32_t conn_id,
+                            WebSocketServer::ReceiveQueueStats& stats);
 
   bool startListening(uint16_t port);
   void popMessages();
@@ -56,6 +61,7 @@ class WebSocketServerInternal {
   WebSocketServer::ConnectCallback connect_cb = nullptr;
   WebSocketServer::MessageCallback message_cb = nullptr;
   WebSocketServer::CloseCallback close_cb = nullptr;
+  WebSocketServer::CloseDetailsCallback close_details_cb = nullptr;
   WebSocketServer::PongCallback pong_cb = nullptr;
 
   struct tcp_pcb* listen_pcb = nullptr;

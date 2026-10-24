@@ -18,6 +18,10 @@ void WebSocketServer::setMessageCallback(MessageCallback cb) {
 void WebSocketServer::setCloseCallback(CloseCallback cb) {
   internal->setCloseCallback(cb);
 }
+
+void WebSocketServer::setCloseDetailsCallback(CloseDetailsCallback cb) {
+  internal->setCloseDetailsCallback(cb);
+}
 void WebSocketServer::setPongCallback(PongCallback cb) {
   internal->setPongCallback(cb);
 }
@@ -59,6 +63,10 @@ bool WebSocketServer::flush(uint32_t conn_id) {
 
 bool WebSocketServer::setReceiveLimits(const ReceiveLimits& limits) {
   return internal->setReceiveLimits(limits);
+}
+bool WebSocketServer::getReceiveQueueStats(uint32_t conn_id,
+                                           ReceiveQueueStats& stats) {
+  return internal->getReceiveQueueStats(conn_id, stats);
 }
 
 bool WebSocketServer::abort(uint32_t conn_id) {
