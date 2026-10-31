@@ -45,6 +45,11 @@ err_t on_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* pb, err_t err) {
       connection->setCloseReason(WebSocketServer::CloseReason::tcp_error, err);
       keep_connection = false;
     } else {
+      // Interactive traffic: ACK now rather than on the 250 ms lwIP fast
+      // timer, so a sender that coalesces small writes never holds a
+      // keystroke behind an unacknowledged frame. A reply sent while
+      // processing carries the ACK; otherwise tcp_input() sends it on return.
+      tcp_set_flags(pcb, TF_ACK_NOW);
       keep_connection = connection->process(pb);
     }
     tcp_recved(pcb, pb->tot_len);
