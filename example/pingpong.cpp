@@ -47,7 +47,8 @@ static void on_connect(WebSocketServer& server, uint32_t conn_id) {
   printf("WS connected (id=%u)\n", conn_id);
 }
 
-static void on_disconnect(WebSocketServer& server, uint32_t conn_id) {
+static void on_disconnect(WebSocketServer& server, uint32_t conn_id,
+                          WebSocketServer::CloseReason reason, int transport_error) {
   printf("WS closed (id=%u)\n", conn_id);
   if (conn_id == last_conn_id) {
     last_conn_id = 0;
@@ -138,6 +139,7 @@ int main() {
 
   while (1) {
     cyw43_arch_poll();
+    server.poll();
     maybe_send_ping(server);
   }
 }

@@ -1,32 +1,15 @@
 #include "client_connection.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <string.h>
-#include <queue>
 
 #include "cyw43_config.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
 #include "lwip/sys.h"
 
-#include "web_socket_message.h"
 #include "web_socket_server_internal.h"
 #include "debug.h"
-
-void ClientConnection::popMessages() {
-  onPoll();
-  for (size_t count = 0; count < limits.dispatchMessages &&
-       !message_queue.empty() && !isClosing(); ++count) {
-    WebSocketMessage message(std::move(message_queue.front()));
-    message_queue.pop();
-    queued_bytes -= message.getPayloadSize();
-    if (message.getType() == WebSocketMessage::PONG)
-      server.onPong(this, message.getPayload(), message.getPayloadSize());
-    else
-      server.onMessage(this, message.getPayload(), message.getPayloadSize());
-  }
-}
 
 void ClientConnection::onPoll() {
   retryPong();
@@ -45,30 +28,26 @@ bool ClientConnection::process(struct pbuf* pb) {
 bool ClientConnection::processData(struct pbuf* pb) {
   if (abort_requested)
     return false;
-  bool result;
-  if (http_handler.isUpgraded()) {
-    result = ws_handler.process(pb);
-  } else {
-    size_t consumed = 0;
-    result = http_handler.process(pb, consumed);
-    if (result && http_handler.isUpgraded()) {
-      server.onUpgrade(this);
-      if (abort_requested)
-        return true;
-      for (const pbuf* span = pb; span; span = span->next) {
-        if (consumed >= span->len) {
-          consumed -= span->len;
-          continue;
-        }
-        if (!ws_handler.process(static_cast<const uint8_t*>(span->payload) + consumed,
-                                span->len - consumed))
-          return false;
-        consumed = 0;
-      }
-    }
+  // WebSocket frames may share a segment with the upgrade request.
+  size_t consumed = 0;
+  if (!http_handler.isUpgraded()) {
+    if (!http_handler.process(pb, consumed))
+      return false;
+    if (!http_handler.isUpgraded())
+      return true;
+    server.onUpgrade(this);
   }
-
-  return result;
+  for (const pbuf* span = pb; span; span = span->next) {
+    if (consumed >= span->len) {
+      consumed -= span->len;
+      continue;
+    }
+    if (!ws_handler.process(static_cast<const uint8_t*>(span->payload) + consumed,
+                            span->len - consumed))
+      return false;
+    consumed = 0;
+  }
+  return !abort_requested && !ws_handler.isClosing();
 }
 
 bool ClientConnection::sendRaw(const void* data, size_t size) {
@@ -105,6 +84,10 @@ bool ClientConnection::flushSend() {
     return false;
   if (!flush_pending)
     return true;
+  // lwIP ignores output requested inside its receive callback and sends when
+  // the callback returns. Keep the flush pending so poll() confirms it.
+  if (processing)
+    return true;
   err_t result = tcp_output(pcb);
   if (result == ERR_OK)
     flush_pending = false;
@@ -127,36 +110,26 @@ bool ClientConnection::onSent(uint16_t len) {
 
 void ClientConnection::onClose() {
   abort_requested = true;
-  server.onClose(this, http_handler.isUpgraded());
+  server.onClose(this);
 }
 
-bool ClientConnection::isClosing() {
-  return abort_requested || http_handler.isClosing() || ws_handler.isClosing();
+void ClientConnection::deliverMessage(const void* payload, size_t size) {
+  server.onMessage(this, payload, size);
 }
 
-bool ClientConnection::processWebSocketMessage(WebSocketMessage&& message) {
-  const size_t next_messages = message_queue.size() + 1;
-  const size_t next_bytes = queued_bytes + message.getPayloadSize();
-  peak_queued_messages = std::max(peak_queued_messages, next_messages);
-  peak_queued_bytes = std::max(peak_queued_bytes, next_bytes);
-  if (next_messages > limits.queuedMessages) {
-    setCloseReason(WebSocketServer::CloseReason::receive_queue_message_limit);
-    DEBUG("WebSocket receive queue message limit exceeded: %u/%u",
-          (unsigned)next_messages, (unsigned)limits.queuedMessages);
-    return false;
-  }
-  if (next_bytes > limits.queuedBytes) {
-    setCloseReason(WebSocketServer::CloseReason::receive_queue_byte_limit);
-    DEBUG("WebSocket receive queue byte limit exceeded: %u/%u",
-          (unsigned)next_bytes, (unsigned)limits.queuedBytes);
-    return false;
-  }
-  queued_bytes += message.getPayloadSize();
-  message_queue.push(std::move(message));
-  return true;
+void ClientConnection::deliverPong(const void* payload, size_t size) {
+  server.onPong(this, payload, size);
 }
 
-bool ClientConnection::sendWebSocketPong(const void* payload, size_t size) {
+size_t ClientConnection::maxMessageBytes() const {
+  return server.maxMessageBytes();
+}
+
+uint8_t* ClientConnection::frameBuffer(size_t size) {
+  return server.frameBuffer(size);
+}
+
+bool ClientConnection::sendPong(const void* payload, size_t size) {
   if (pong_pending) {
     setCloseReason(WebSocketServer::CloseReason::pong_backpressure);
     DEBUG("WebSocket pending PONG limit exceeded");
@@ -173,8 +146,7 @@ bool ClientConnection::sendWebSocketPong(const void* payload, size_t size) {
 bool ClientConnection::retryPong() {
   if (!pong_pending)
     return true;
-  auto result = ws_handler.enqueueMessage(
-      WebSocketMessage(WebSocketMessage::PONG, pong_payload.data(), pong_size));
+  auto result = ws_handler.enqueue(WebSocketHandler::PONG, pong_payload.data(), pong_size);
   if (result == WebSocketServer::SendResult::would_block)
     return true;
   if (result != WebSocketServer::SendResult::queued) {
@@ -187,44 +159,20 @@ bool ClientConnection::retryPong() {
   return !abort_requested;
 }
 
-void ClientConnection::processWebSocketPong(const void* payload, size_t size) {
-  server.onPong(this, payload, size);
+WebSocketServer::SendResult ClientConnection::enqueueMessage(WebSocketHandler::Opcode opcode,
+                                                             const void* payload, size_t size) {
+  if (!http_handler.isUpgraded() || abort_requested)
+    return WebSocketServer::SendResult::closed;
+  return ws_handler.enqueue(opcode, payload, size);
 }
 
-bool ClientConnection::sendWebSocketTextMessage(const char* payload) {
-  if (!http_handler.isUpgraded()) {
+bool ClientConnection::sendMessage(WebSocketHandler::Opcode opcode, const void* payload, size_t size) {
+  if (enqueueMessage(opcode, payload, size) != WebSocketServer::SendResult::queued)
     return false;
-  }
-
-  if (!payload) {
-    payload = "";
-  }
-
-  return ws_handler.sendMessage(WebSocketMessage(WebSocketMessage::TEXT, payload, strlen(payload)));
-}
-
-bool ClientConnection::sendWebSocketBinaryMessage(const void* payload, size_t size) {
-  if (!http_handler.isUpgraded()) {
-    return false;
-  }
-
-  return ws_handler.sendMessage(WebSocketMessage(WebSocketMessage::BINARY, payload, size));
-}
-
-bool ClientConnection::sendWebSocketPing(const void* payload, size_t size) {
-  if (!http_handler.isUpgraded()) {
-    return false;
-  }
-
-  return ws_handler.sendMessage(WebSocketMessage(WebSocketMessage::PING, payload, size));
-}
-
-bool ClientConnection::sendWebSocketMessage(const char* payload) {
-  return sendWebSocketTextMessage(payload);
-}
-
-bool ClientConnection::sendWebSocketMessage(const void* payload, size_t size) {
-  return sendWebSocketBinaryMessage(payload, size);
+  // TCP already owns the bytes even if output fails. flushSend retries without
+  // enqueueing another copy from sent/poll callbacks.
+  flushSend();
+  return true;
 }
 
 bool ClientConnection::close() {
@@ -251,12 +199,6 @@ void ClientConnection::markCloseTimeout() {
       (close_reason == WebSocketServer::CloseReason::local_close ||
        close_reason == WebSocketServer::CloseReason::unknown))
     close_reason = WebSocketServer::CloseReason::close_timeout;
-}
-
-WebSocketServer::SendResult ClientConnection::enqueueWebSocketMessage(const void* payload, size_t size) {
-  if (!http_handler.isUpgraded() || abort_requested)
-    return WebSocketServer::SendResult::closed;
-  return ws_handler.enqueueMessage(WebSocketMessage(WebSocketMessage::BINARY, payload, size));
 }
 
 void ClientConnection::detachAndAbort() {

@@ -18,10 +18,6 @@ void WebSocketServer::setMessageCallback(MessageCallback cb) {
 void WebSocketServer::setCloseCallback(CloseCallback cb) {
   internal->setCloseCallback(cb);
 }
-
-void WebSocketServer::setCloseDetailsCallback(CloseDetailsCallback cb) {
-  internal->setCloseDetailsCallback(cb);
-}
 void WebSocketServer::setPongCallback(PongCallback cb) {
   internal->setPongCallback(cb);
 }
@@ -35,12 +31,15 @@ void* WebSocketServer::getCallbackExtra() {
 bool WebSocketServer::startListening(uint16_t port) {
   return internal->startListening(port);
 }
-void WebSocketServer::popMessages() {
-  internal->popMessages();
+void WebSocketServer::poll() {
+  internal->poll();
 }
 
 void WebSocketServer::setTcpNoDelay(bool enabled) {
   internal->setTcpNoDelay(enabled);
+}
+bool WebSocketServer::setMaxMessageSize(size_t bytes) {
+  return internal->setMaxMessageSize(bytes);
 }
 
 bool WebSocketServer::sendMessage(uint32_t conn_id, const char* payload) {
@@ -59,14 +58,6 @@ WebSocketServer::SendResult WebSocketServer::enqueueMessage(uint32_t conn_id, co
 
 bool WebSocketServer::flush(uint32_t conn_id) {
   return internal->flush(conn_id);
-}
-
-bool WebSocketServer::setReceiveLimits(const ReceiveLimits& limits) {
-  return internal->setReceiveLimits(limits);
-}
-bool WebSocketServer::getReceiveQueueStats(uint32_t conn_id,
-                                           ReceiveQueueStats& stats) {
-  return internal->getReceiveQueueStats(conn_id, stats);
 }
 
 bool WebSocketServer::abort(uint32_t conn_id) {

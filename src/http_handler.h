@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "lwip/pbuf.h"
+#include "lwip/tcp.h"
 
 class ClientConnection;
 
@@ -21,7 +22,7 @@ class HTTPHandler {
 
  private:
   static constexpr auto HEADER_BUF_SIZE = 64;
-  static constexpr size_t HTML_CHUNK_SIZE = 512;
+  static constexpr size_t HTML_CHUNK_SIZE = TCP_MSS;
 
   enum RequestPart {
     METHOD,

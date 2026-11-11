@@ -9,6 +9,8 @@ Users must also link this library with an implementation of `pico_cyw43_arch` (e
 Warning: the `pico_cyw43_arch` implementation must allow standard library functions (including `malloc`/`free`) to be called from network workers. Since `pico_cyw43_arch_lwip_threadsafe_background` executes workers within ISRs, it is typically not safe unless you have added a critical section
 wrapper around `malloc` and friends.
 
+All application callbacks run in the lwIP context that delivered the event. With `pico_cyw43_arch_lwip_poll` that is the thread calling `cyw43_arch_poll()`; with `pico_cyw43_arch_lwip_threadsafe_background` it is the interrupt-level network worker, so callbacks must then be interrupt-safe.
+
 ## Important Usage Warnings
 
 ⚠️ **Core Affinity**: All WebSocket server operations (initialization, polling, message sending) must execute on the **same core** where the WiFi/CYW43 driver was initialized. The CYW43 driver maintains core-specific state and is not thread-safe across cores. Violating this requirement will cause undefined behavior, crashes, or data corruption.
@@ -56,7 +58,8 @@ void on_connect(WebSocketServer& server, uint32_t conn_id) {
   printf("Client connected: %u\n", conn_id);
 }
 
-void on_disconnect(WebSocketServer& server, uint32_t conn_id) {
+void on_disconnect(WebSocketServer& server, uint32_t conn_id,
+                   WebSocketServer::CloseReason reason, int transport_error) {
   printf("Client disconnected: %u\n", conn_id);
 }
 
@@ -86,8 +89,8 @@ int main() {
   
   // 6. Main loop for pico_cyw43_arch_lwip_poll: call both regularly
   while (1) {
-    cyw43_arch_poll();  // When using pico_cyw43_arch_lwip_poll
-    server.popMessages();
+    cyw43_arch_poll();  // Delivers messages to the callbacks
+    server.poll();      // Retries blocked output, reclaims closed connections
   }
 }
 ```
@@ -115,6 +118,7 @@ int main() {
   
   while (1) {
     cyw43_arch_poll();
+    server.poll();
     
     // Periodically send PING to check client liveness
     if (should_send_ping()) {
@@ -133,42 +137,35 @@ int main() {
 - **`bool startListening(uint16_t port)`**  
   Starts the server listening on the specified port. Returns `true` on success.
 
-### Message Processing
-- **`void popMessages()`**  
-  Must be called routinely in your main loop to process incoming messages. This triggers registered message callbacks for any queued messages.
+### Housekeeping
+- **`void poll()`**  
+  Call routinely in your main loop. It retries output that TCP could not take earlier and reclaims connections that were aborted or whose close grace period expired. Received messages do not wait for it: they reach the callbacks as the data arrives.
 
 ### Callbacks
 All callbacks receive a `WebSocketServer&` reference and `conn_id` to identify the connection. Use `setCallbackExtra()` to pass custom application state.
 
+Connect, message and PONG callbacks run inside the TCP receive callback that delivered them; the close callback runs there, from a TCP timer or from `poll()`. Every callback may send to, `close()` or `abort()` any connection, including its own: teardown waits until the callback returns.
+
+Prefer to record state in a callback and send from the main loop. On the CYW43 radio, a frame sent from the receive path can exhaust the driver's transmit credit while received frames are still queued in the chip; the driver discards the frames it reads while waiting for credit, and the peer stalls until TCP retransmits them.
+
 #### Connection Lifecycle
 - **`void setConnectCallback(ConnectCallback cb)`**  
   Callback signature: `void callback(WebSocketServer& server, uint32_t conn_id)`  
-  Called when a new WebSocket connection is established.  
-  ⚠️ **Warning**: May be called from ISR context. Use caution with shared data and avoid acquiring mutexes.
+  Called when a new WebSocket connection is established.
 
 - **`void setCloseCallback(CloseCallback cb)`**  
-  Callback signature: `void callback(WebSocketServer& server, uint32_t conn_id)`  
-  Called when a connection closes.  
-  ⚠️ **Warning**: May be called from ISR context. Use caution with shared data and avoid acquiring mutexes.
-
-- **`void setCloseDetailsCallback(CloseDetailsCallback cb)`**
-  Optional callback invoked immediately before `setCloseCallback`. It reports
-  the library's close reason, lwIP transport error code when available, and
-  current/peak receive queue usage with configured limits. Queue overflow
-  distinguishes message-count and byte limits. It runs in the same context as
-  the close callback, so use atomic/shared-state handling if needed.
+  Callback signature: `void callback(WebSocketServer& server, uint32_t conn_id, CloseReason reason, int transport_error)`  
+  Called once when a connection closes. `reason` is the library's cause (peer TCP close, peer WebSocket close, invalid input, PONG backpressure, TCP write/output/other error, close timeout, server abort or local close); `transport_error` is the lwIP error code when one caused the close, otherwise 0. The connection is already gone: sends to it return `closed`.
 
 #### Message Handling
 - **`void setMessageCallback(MessageCallback cb)`**  
   Callback signature: `void callback(WebSocketServer& server, uint32_t conn_id, const void* data, size_t len)`  
-  Called when a complete message is received. The `data` pointer includes an extra null terminator for TEXT messages, allowing safe treatment as a C string.  
-  **Context**: Not called from ISR, but holds the cyw43 context lock.
+  Called when a complete message is received. `data` is valid only during the callback and is followed by a null terminator, allowing a TEXT message to be treated as a C string.
 
 #### PING/PONG Monitoring
 - **`void setPongCallback(PongCallback cb)`**  
   Callback signature: `void callback(WebSocketServer& server, uint32_t conn_id, const void* data, size_t len)`  
-  Called when a PONG frame is received (typically in response to `sendPing()`). If no callback is registered, PONG frames are silently ignored.  
-  **Context**: Same as message callback (cyw43 lock held, not ISR).
+  Called when a PONG frame is received (typically in response to `sendPing()`). If no callback is registered, PONG frames are silently ignored.
 
 #### Custom Application State
 - **`void setCallbackExtra(void* arg)`**  
@@ -182,8 +179,7 @@ All callbacks receive a `WebSocketServer&` reference and `conn_id` to identify t
 `sendMessage`, `sendPing` and broadcasts return **TCP enqueue success**, not
 delivery or flush success. Once `tcp_write` accepts a complete frame, a failed
 `tcp_output` leaves it owned by TCP. The library retries output from sent/poll
-callbacks and `popMessages()` without enqueueing another copy. This replaces
-the previous ambiguous `false` on accepted-write/failed-flush behaviour.
+callbacks and `poll()` without enqueueing another copy.
 Application-level consumption acknowledgements remain the application's job.
 
 For bursts, use `enqueueMessage(id, data, size)` for each binary frame, then
@@ -192,8 +188,10 @@ immediate flush. Enqueue returns `SendResult::queued`, `would_block`, `closed`,
 `invalid`, `too_large`, `no_memory`, or `error`. Only `queued` transfers bytes
 to TCP; only `would_block` indicates retryable write backpressure. A failed
 flush never authorises resubmitting accepted frames. Fatal transport errors
-schedule teardown. Frames remain contiguous, single-copy `tcp_write` calls;
-frames exceeding the configured `TCP_SND_BUF` cannot be queued atomically.
+schedule teardown. Each frame is one contiguous `tcp_write`, assembled in a
+buffer the server allocates once and reuses, so backpressure never leaves part
+of a frame queued. Frames exceeding the configured `TCP_SND_BUF` cannot be
+queued atomically.
 
 #### Unicast (Single Connection)
 - **`bool sendMessage(uint32_t conn_id, const char* payload)`**  
@@ -216,35 +214,31 @@ frames exceeding the configured `TCP_SND_BUF` cannot be queued atomically.
 - **`bool close(uint32_t conn_id)`**  
   Begin graceful shutdown, stopping application dispatch and sends. Returns whether
   the close frame was accepted (or closing already began). Closing state is set
-  even if the write fails. A one-second grace deadline bounds reclamation, checked
-  by `popMessages()` and the approximately 500 ms TCP poll callback.
+  even if the write fails. From a callback for the same connection, the TCP
+  connection closes as soon as the callback returns. Otherwise a one-second grace
+  deadline bounds reclamation, checked by `poll()` and the approximately 500 ms
+  TCP poll callback.
 
 - **`bool abort(uint32_t conn_id)`**
-  Request unconditional teardown at the next safe `popMessages()`/TCP poll
-  boundary. Safe from connect, message and PONG callbacks; it never deletes
-  the connection while parsing or dispatching its callback. Close notification
-  occurs once and the slot is reusable. Destruction detaches all callbacks and
-  releases clients/listener without user notifications; destroy the server only
-  outside callbacks while its CYW43 context remains usable.
+  Request unconditional teardown. Safe from every callback: a connection is never
+  deleted while its own callback is running. Its teardown happens when its receive
+  callback returns, or at the next `poll()`/TCP poll. Close notification occurs once
+  and the slot is reusable. Destruction detaches all callbacks and releases
+  clients/listener without user notifications; destroy the server only outside
+  callbacks while its CYW43 context remains usable.
 
-### Receive Limits
+### Message Size Limit
 
-Call `setReceiveLimits({messageBytes, queuedBytes, queuedMessages, dispatchMessages})`
-before listening. Invalid settings or changes after listening return `false`.
-Defaults are 64,000 message bytes, 64,000 queued payload bytes, 16 queued messages,
-and eight callbacks per connection per `popMessages()` call. The incomplete frame
-and fragmented message are also bounded by `messageBytes`; control frames retain
-the RFC 125-byte limit. Size/count overflow closes the connection with a diagnostic
-when `DEBUG_PRINT` is enabled, rather than silently dropping application bytes.
-These are payload limits, not a total heap budget: vector capacity, NUL terminators,
-partial frames and transport/container overhead also consume memory.
-`getReceiveQueueStats(conn_id, stats)` snapshots current and peak queued messages
-and payload bytes, together with the configured queue limits, for a live connection.
+Call `setMaxMessageSize(bytes)` before listening; it returns `false` for zero,
+more than 64,000 bytes, or after listening has started. The default is 64,000
+bytes. The limit covers a whole message including all its fragments; control
+frames keep the RFC 125-byte limit. A larger message closes the connection
+rather than silently dropping application bytes. Each connection keeps one
+message buffer that grows to the largest message it has received.
 
 PING replies are immediate when possible. One pending PONG (up to 125 bytes)
 survives TCP backpressure and is retried without duplicate enqueue; another PING
-before that pending reply fits closes the overloaded connection. PONG notifications,
-like message callbacks, are dispatched by `popMessages()`, not the receive callback.
+before that pending reply fits closes the overloaded connection.
 
 ### TCP Options
 - **`void setTcpNoDelay(bool enabled)`**  
@@ -253,15 +247,18 @@ like message callbacks, are dispatched by `popMessages()`, not the receive callb
 
 ## Performance Notes
 HTTP and WebSocket receive paths traverse pbuf spans once. Frame headers are
-decoded once; masking is applied during the payload copy. Ordinary final messages
-move their payload buffer directly into the bounded queue, retaining the text
-callback's extra NUL without a frame list or second payload copy. Fragmented
-messages support interleaved PING/PONG controls and enforce continuation ordering.
+decoded once; masking is applied while the payload is copied straight into the
+connection's message buffer, where fragments are assembled in place. The
+application callback reads that buffer directly, so a received message costs one
+payload copy and no heap allocation. Fragmented messages support interleaved
+PING/PONG controls and enforce continuation ordering. Connections live in a
+fixed set of slots sized by `max_connections`.
 HTTP content is flushed once per available burst and remains alive until its last
 byte is acknowledged, including backpressure before the first body chunk.
 
 Host regressions in the consuming Z80ROMlessSBC project compile all server sources
 against fake lwIP and real Mbed TLS. They verify exact TCP write/flush counts,
-buffer ownership, split/chained input, queue limits, fairness and teardown.
+split/chained input, the message size limit, callbacks that send, close or abort,
+teardown, and that steady-state traffic makes no heap allocations.
 These tests do not establish physical Wi-Fi throughput or latency; see
-[validation notes](LATENCY_OPTIMIZATIONS.md).
+[latency design](LATENCY_OPTIMIZATIONS.md).
